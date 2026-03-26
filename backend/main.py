@@ -7,6 +7,7 @@ from backend.db.database import engine, Base
 import socketio
 from routes.predict import router as predict_router
 app.include_router(predict_router)
+
 # Rate Limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address

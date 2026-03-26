@@ -8,15 +8,16 @@ Queries historical IoT sensor data to cross-check uncertain predictions.
 from __future__ import annotations
 
 import json
-import os
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 
-# Lazy imports — only load if RAG is actually used
-_faiss       = None
+logger = logging.getLogger(__name__)
+
+_faiss               = None
 _SentenceTransformer = None
 
 IOT_LOGS_PATH = Path(__file__).parent / "data" / "iot_logs.json"
@@ -54,28 +55,29 @@ class RAGResult:
 # ── Physics rules ──────────────────────────────────────────────────────────────
 def _physics_check(log: dict, defect_type: str) -> tuple[bool, str]:
     """
-    Simple rule engine:
-    - If torque_delta < 5% AND no vibration spike → misalignment unlikely
-    - If temperature_ok AND no vibration → surface defect less likely
+    Rule engine based on iot_logs.json fields:
+    temperature_c, humidity_pct, action, sensor
     """
-    torque_delta = abs(log.get("torque_delta_pct", 0))
-    vibration    = log.get("vibration_spike", False)
-    temp_ok      = log.get("temperature_normal", True)
+    temp      = float(log.get("temperature_c", 25))
+    humidity  = float(log.get("humidity_pct",  50))
+    action    = log.get("action", "")
 
-    misalignment_types = {"misalignment", "pitted_surface", "inclusion"}
-    surface_types      = {"crazing", "scratches", "rolled_in_scale", "patches"}
+    # High temp + high humidity → crazing / patches plausible
+    heat_types = {"crazing", "patches", "pitted_surface", "rolled_in_scale"}
+    pcb_types  = {"mouse_bite", "open_circuit", "short", "spur", "spurious_copper", "pcb_missing_hole",
+                  "pcb_mouse_bite", "pcb_open_circuit", "pcb_short", "pcb_spur", "pcb_spurious_copper"}
 
-    if defect_type in misalignment_types:
-        if torque_delta < 5.0 and not vibration:
-            return False, f"Physics FAIL: torque_delta={torque_delta:.1f}% < 5%, no vibration → {defect_type} unlikely"
-        return True, f"Physics OK: torque_delta={torque_delta:.1f}%, vibration={vibration}"
+    if defect_type in heat_types:
+        if temp > 70 and humidity > 60:
+            return True, f"Physics OK: temp={temp}°C, humidity={humidity}% — {defect_type} plausible"
+        if temp < 50:
+            return False, f"Physics FAIL: temp={temp}°C too low for {defect_type}"
+        return True, f"Physics OK: temp/humidity within range"
 
-    if defect_type in surface_types:
-        if temp_ok and not vibration:
-            return True, f"Physics OK: temp normal, no vibration → {defect_type} plausible"
-        return True, "Physics OK: conditions consistent"
+    if defect_type in pcb_types:
+        # PCB defects don't depend on temperature
+        return True, f"Physics OK: PCB defect — no thermal constraint"
 
-    # PCB / MVTec defects — no specific physics rule yet
     return True, "Physics OK: no specific rule for this class"
 
 
@@ -86,7 +88,11 @@ class RAGVerifier:
     and cross-checks uncertain predictions.
     """
 
-    def __init__(self, logs_path: str = str(IOT_LOGS_PATH), model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(
+        self,
+        logs_path:  str = str(IOT_LOGS_PATH),
+        model_name: str = "all-MiniLM-L6-v2",
+    ):
         self.logs_path  = logs_path
         self.model_name = model_name
         self._logs      = []
@@ -94,47 +100,50 @@ class RAGVerifier:
         self._encoder   = None
         self._ready     = False
 
+    # ── FIX: _log_to_text now matches actual iot_logs.json fields ──────────────
+    def _log_to_text(self, log: dict) -> str:
+        """Convert a log entry to a searchable text string."""
+        return (
+            f"defect={log.get('defect_class', 'unknown')} "
+            f"sensor={log.get('sensor', 'unknown')} "
+            f"temperature={log.get('temperature_c', 0):.0f}c "
+            f"humidity={log.get('humidity_pct', 0):.0f}pct "
+            f"action={log.get('action', 'unknown')} "
+            f"notes={log.get('notes', '')}"
+        )
+
     def _load(self):
         if self._ready:
             return
         _import_deps()
 
-        # Load IoT logs
-        with open(self.logs_path, "r") as f:
+        with open(self.logs_path, "r", encoding="utf-8") as f:
             self._logs = json.load(f)
 
-        # Build text representations for embedding
-        texts = [self._log_to_text(log) for log in self._logs]
-
-        # Encode
+        texts         = [self._log_to_text(log) for log in self._logs]
         self._encoder = _SentenceTransformer(self.model_name)
-        embeddings    = self._encoder.encode(texts, convert_to_numpy=True)
-        embeddings    = embeddings.astype("float32")
+        embeddings    = self._encoder.encode(texts, convert_to_numpy=True).astype("float32")
 
-        # FAISS index
         dim          = embeddings.shape[1]
         self._index  = _faiss.IndexFlatL2(dim)
         self._index.add(embeddings)
 
         self._ready = True
-        print(f"[RAG] Index built: {len(self._logs)} IoT logs, dim={dim}")
+        logger.info("[RAG] Index built: %d IoT logs, dim=%d", len(self._logs), dim)
 
-    def _log_to_text(self, log: dict) -> str:
-        return (
-            f"part_id={log.get('part_id', 'unknown')} "
-            f"line={log.get('line_id', '?')} "
-            f"torque_delta={log.get('torque_delta_pct', 0):.1f}pct "
-            f"vibration={'yes' if log.get('vibration_spike') else 'no'} "
-            f"temp={'normal' if log.get('temperature_normal', True) else 'high'} "
-            f"defect_history={log.get('recent_defect_type', 'none')}"
-        )
+    # ── FIX: _build_index added — routes/iot.py calls this after ingesting ─────
+    def _build_index(self):
+        """Force a full index rebuild (called after new data is ingested)."""
+        self._ready = False
+        self._load()
+        logger.info("[RAG] Index rebuilt with %d logs", len(self._logs))
 
     def verify(
         self,
         defect_type: str,
-        part_id: Optional[str] = None,
-        line_id: Optional[str] = None,
-        top_k: int = 1,
+        part_id:    Optional[str] = None,
+        line_id:    Optional[str] = None,
+        top_k:      int           = 1,
     ) -> RAGResult:
         """
         Cross-check a defect prediction against IoT history.
@@ -142,33 +151,28 @@ class RAGVerifier:
         """
         try:
             self._load()
-        except Exception as e:
-            # Graceful fallback if FAISS/sentence-transformers not installed
+        except Exception as exc:
+            logger.warning("[RAG] Unavailable: %s — defaulting to plausible", exc)
             return RAGResult(
                 plausible        = True,
-                verdict          = f"RAG unavailable ({e}) — defaulting to plausible",
+                verdict          = f"RAG unavailable ({exc}) — defaulting to plausible",
                 matched_log      = None,
                 similarity_score = 0.0,
                 physics_check    = "skipped",
             )
 
-        # Build query text
         query = (
             f"defect={defect_type} "
-            f"part_id={part_id or 'unknown'} "
-            f"line={line_id or 'unknown'}"
+            f"sensor={line_id or 'unknown'} "
+            f"notes={defect_type} defect detected"
         )
-        q_emb = self._encoder.encode([query], convert_to_numpy=True).astype("float32")
-
+        q_emb              = self._encoder.encode([query], convert_to_numpy=True).astype("float32")
         distances, indices = self._index.search(q_emb, top_k)
-        best_idx  = int(indices[0][0])
-        best_dist = float(distances[0][0])
+        best_idx           = int(indices[0][0])
+        best_dist          = float(distances[0][0])
+        similarity         = float(1 / (1 + best_dist))
+        matched            = self._logs[best_idx]
 
-        # Convert L2 distance → similarity score (0-1)
-        similarity = float(1 / (1 + best_dist))
-        matched    = self._logs[best_idx]
-
-        # Physics rule check
         plausible, physics_msg = _physics_check(matched, defect_type)
 
         verdict = (
@@ -189,8 +193,13 @@ class RAGVerifier:
 # ── Singleton ──────────────────────────────────────────────────────────────────
 _verifier: Optional[RAGVerifier] = None
 
+
 def get_verifier() -> RAGVerifier:
     global _verifier
     if _verifier is None:
         _verifier = RAGVerifier()
     return _verifier
+
+
+# ── FIX: expose rag_verifier alias — routes/iot.py imports this ───────────────
+rag_verifier = get_verifier()
